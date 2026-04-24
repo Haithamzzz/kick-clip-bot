@@ -14,6 +14,7 @@ import {
   fetchOpenGraphImage,
   parseClipInput,
 } from './parse-clip.js';
+import { downloadClipWithYtDlp } from './ytdlp.js';
 
 const EMBED_COLOR = 0x232428;
 
@@ -158,22 +159,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
     let imageUrl = thumbnailAttachment?.url || overrideImage || null;
 
     if (parsed.kind === 'kick' && parsed.clipId) {
-      console.log(`[addclip] fetching Kick clip data for ${parsed.clipId}`);
-      const kick = await fetchKickClipData(parsed.clipId);
-      console.log('[addclip] kick data:', {
-        hasVideo: Boolean(kick?.videoUrl),
-        hasThumbnail: Boolean(kick?.thumbnailUrl),
-        apiStatus: kick?.debug,
+      // Primary: yt-dlp (bypasses Cloudflare using its built-in Kick extractor).
+      console.log(`[addclip] yt-dlp downloading ${parsed.canonicalUrl}`);
+      videoBuffer = await downloadClipWithYtDlp(parsed.canonicalUrl);
+      console.log('[addclip] yt-dlp result:', {
+        ok: Boolean(videoBuffer),
+        bytes: videoBuffer?.length ?? 0,
       });
-      if (kick?.videoUrl) {
-        console.log(`[addclip] downloading mp4 from ${kick.videoUrl.slice(0, 80)}...`);
-        videoBuffer = await downloadMp4ToBuffer(kick.videoUrl);
-        console.log('[addclip] mp4 download result:', {
-          ok: Boolean(videoBuffer),
-          bytes: videoBuffer?.length ?? 0,
-        });
+
+      if (!videoBuffer) {
+        // Fallback: try direct Kick API (may need KICK_COOKIE).
+        console.log('[addclip] falling back to Kick API');
+        const kick = await fetchKickClipData(parsed.clipId);
+        console.log('[addclip] kick api:', kick?.debug);
+        if (kick?.videoUrl) {
+          videoBuffer = await downloadMp4ToBuffer(kick.videoUrl);
+        }
+        if (!imageUrl && kick?.thumbnailUrl) imageUrl = kick.thumbnailUrl;
       }
-      if (!imageUrl && kick?.thumbnailUrl) imageUrl = kick.thumbnailUrl;
     }
 
     if (!imageUrl && !videoBuffer) {
