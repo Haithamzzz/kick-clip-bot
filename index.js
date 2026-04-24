@@ -158,9 +158,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     let imageUrl = thumbnailAttachment?.url || overrideImage || null;
 
     if (parsed.kind === 'kick' && parsed.clipId) {
+      console.log(`[addclip] fetching Kick clip data for ${parsed.clipId}`);
       const kick = await fetchKickClipData(parsed.clipId);
+      console.log('[addclip] kick data:', {
+        hasVideo: Boolean(kick?.videoUrl),
+        hasThumbnail: Boolean(kick?.thumbnailUrl),
+        apiStatus: kick?.debug,
+      });
       if (kick?.videoUrl) {
+        console.log(`[addclip] downloading mp4 from ${kick.videoUrl.slice(0, 80)}...`);
         videoBuffer = await downloadMp4ToBuffer(kick.videoUrl);
+        console.log('[addclip] mp4 download result:', {
+          ok: Boolean(videoBuffer),
+          bytes: videoBuffer?.length ?? 0,
+        });
       }
       if (!imageUrl && kick?.thumbnailUrl) imageUrl = kick.thumbnailUrl;
     }

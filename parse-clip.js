@@ -127,9 +127,13 @@ export async function fetchKickClipData(clipId) {
       },
       signal: AbortSignal.timeout(15_000),
     });
-    if (!res.ok) return null;
+    const debug = `${res.status} ${res.statusText}`;
+    if (!res.ok) {
+      console.log(`[kick api] non-ok response: ${debug}`);
+      return { debug };
+    }
     const data = await res.json().catch(() => null);
-    if (!data) return null;
+    if (!data) return { debug: `${debug} (no json)` };
 
     const clip = data.clip || data;
     const videoUrl = clip.clip_url || clip.video_url || clip.video?.url || null;
@@ -138,9 +142,9 @@ export async function fetchKickClipData(clipId) {
     const duration = clip.duration || null;
     const channelSlug = clip.channel?.slug || clip.channel_slug || null;
 
-    if (!videoUrl) return null;
-    return { videoUrl, thumbnailUrl, title, duration, channelSlug };
-  } catch {
-    return null;
+    return { videoUrl, thumbnailUrl, title, duration, channelSlug, debug };
+  } catch (err) {
+    console.log('[kick api] error:', err?.message || String(err));
+    return { debug: `err: ${err?.message || 'unknown'}` };
   }
 }
