@@ -8,7 +8,11 @@ import {
   GatewayIntentBits,
   EmbedBuilder,
 } from 'discord.js';
-import { fetchOpenGraphImage, parseClipInput } from './parse-clip.js';
+import {
+  fetchKickClipData,
+  fetchOpenGraphImage,
+  parseClipInput,
+} from './parse-clip.js';
 
 const EMBED_COLOR = 0x232428;
 
@@ -39,21 +43,31 @@ async function findLatestImageFromUser(interaction, limit = 30) {
   return null;
 }
 
-function buildClipMessage({ title, pageUrl, displayHandle, imageUrl }) {
-  // If we have our own image, suppress Discord auto-unfurl (<...>) and use custom embed.
-  // If not, send raw URL so Discord can auto-preview Kick (often includes thumbnail).
-  const content = imageUrl
-    ? `New Kick Clip | ${title}\n<${pageUrl}>`
-    : `New Kick Clip | ${title}\n${pageUrl}`;
+function buildClipMessage({
+  title,
+  pageUrl,
+  displayHandle,
+  imageUrl,
+  videoUrl,
+}) {
+  const headerLines = [`New Kick Clip | ${title}`];
+  // Put the mp4 on its own line so Discord unfurls it as an inline video player.
+  if (videoUrl) headerLines.push(videoUrl);
+  // Always include the clip page URL; hide auto-unfurl if we already have media/image.
+  headerLines.push(videoUrl || imageUrl ? `<${pageUrl}>` : pageUrl);
 
-  const embed = new EmbedBuilder()
-    .setColor(EMBED_COLOR)
-    .setAuthor({ name: displayHandle })
-    .setTitle('Kick Clip')
-    .setURL(pageUrl)
-    .setTimestamp();
-
-  if (imageUrl) embed.setImage(imageUrl);
+  const embeds = [];
+  if (!videoUrl && imageUrl) {
+    embeds.push(
+      new EmbedBuilder()
+        .setColor(EMBED_COLOR)
+        .setAuthor({ name: displayHandle })
+        .setTitle('Kick Clip')
+        .setURL(pageUrl)
+        .setImage(imageUrl)
+        .setTimestamp()
+    );
+  }
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -64,8 +78,8 @@ function buildClipMessage({ title, pageUrl, displayHandle, imageUrl }) {
   );
 
   return {
-    content,
-    embeds: imageUrl ? [embed] : [],
+    content: headerLines.join('\n'),
+    embeds,
     components: [row],
   };
 }
@@ -97,11 +111,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const parsed = parseClipInput(pageUrl);
     await interaction.deferReply();
 
+    let videoUrl = null;
     let imageUrl = thumbnailAttachment?.url || overrideImage || null;
-    if (!imageUrl) {
+
+    if (parsed.kind === 'kick' && parsed.clipId) {
+      const kick = await fetchKickClipData(parsed.clipId);
+      if (kick?.videoUrl) videoUrl = kick.videoUrl;
+      if (!imageUrl && kick?.thumbnailUrl) imageUrl = kick.thumbnailUrl;
+    }
+
+    if (!imageUrl && !videoUrl) {
       imageUrl = await findLatestImageFromUser(interaction);
     }
-    if (!imageUrl) {
+    if (!imageUrl && !videoUrl) {
       imageUrl = await fetchOpenGraphImage(parsed.canonicalUrl);
       if (!imageUrl && pageUrl !== parsed.canonicalUrl) {
         imageUrl = await fetchOpenGraphImage(pageUrl);
@@ -113,6 +135,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       pageUrl: parsed.canonicalUrl,
       displayHandle: parsed.displayHandle,
       imageUrl: imageUrl || null,
+      videoUrl: videoUrl || null,
     });
 
     await interaction.editReply({ content, embeds, components });

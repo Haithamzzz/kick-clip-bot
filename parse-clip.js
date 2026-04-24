@@ -11,11 +11,12 @@ export function parseClipInput(rawUrl) {
     const m = u.pathname.match(/^\/([^/]+)\/(clip|clips)\/([^/]+)\/?/i);
     if (m) {
       const username = m[1];
+      const clipId = m[3];
       return {
         kind: 'kick',
         handle: username,
         displayHandle: `@${username}`,
-        // Preserve the original submitted path style (`/clip/` vs `/clips/`)
+        clipId,
         canonicalUrl: `https://kick.com${u.pathname}${u.search}`,
       };
     }
@@ -70,13 +71,9 @@ const metaImageRes = [
  */
 export async function fetchOpenGraphImage(pageUrl) {
   try {
+    const origin = new URL(pageUrl).origin;
     const res = await fetch(pageUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      headers: kickBrowserHeaders({ referer: origin + '/' }),
       signal: AbortSignal.timeout(12_000),
     });
     if (!res.ok) return null;
@@ -89,6 +86,60 @@ export async function fetchOpenGraphImage(pageUrl) {
       }
     }
     return null;
+  } catch {
+    return null;
+  }
+}
+
+function kickBrowserHeaders({ referer } = {}) {
+  const kickCookie = process.env.KICK_COOKIE?.trim();
+  return {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    Accept:
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: referer || 'https://kick.com/',
+    DNT: '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Upgrade-Insecure-Requests': '1',
+    ...(kickCookie ? { Cookie: kickCookie } : {}),
+  };
+}
+
+/**
+ * Ask Kick's v2 clip API for the direct video mp4 URL + thumbnail.
+ * Returns { videoUrl, thumbnailUrl, title, duration, channelSlug } or null.
+ */
+export async function fetchKickClipData(clipId) {
+  if (!clipId) return null;
+  const apiUrl = `https://kick.com/api/v2/clips/${encodeURIComponent(clipId)}`;
+  try {
+    const res = await fetch(apiUrl, {
+      headers: {
+        ...kickBrowserHeaders({ referer: 'https://kick.com/' }),
+        Accept: 'application/json, text/plain, */*',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data) return null;
+
+    const clip = data.clip || data;
+    const videoUrl = clip.clip_url || clip.video_url || clip.video?.url || null;
+    const thumbnailUrl = clip.thumbnail_url || clip.thumbnail?.src || null;
+    const title = clip.title || null;
+    const duration = clip.duration || null;
+    const channelSlug = clip.channel?.slug || clip.channel_slug || null;
+
+    if (!videoUrl) return null;
+    return { videoUrl, thumbnailUrl, title, duration, channelSlug };
   } catch {
     return null;
   }
