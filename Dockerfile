@@ -6,9 +6,9 @@ RUN apt-get update \
       curl \
       ffmpeg \
       python3 \
- && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-      -o /usr/local/bin/yt-dlp \
- && chmod a+rx /usr/local/bin/yt-dlp \
+      python3-pip \
+ && pip3 install --no-cache-dir --break-system-packages \
+      "yt-dlp[default,curl-cffi]" \
  && apt-get purge -y curl \
  && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*

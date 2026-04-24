@@ -15,22 +15,29 @@ export async function downloadClipWithYtDlp(pageUrl, {
     let received = 0;
     const errLines = [];
 
-    const proc = spawn(
-      'yt-dlp',
-      [
-        '-f', 'best[ext=mp4]/best[vcodec!=none][acodec!=none]/best',
-        '-o', '-',
-        '--no-playlist',
-        '--no-warnings',
-        '--quiet',
-        '--no-progress',
-        '--restrict-filenames',
-        '--user-agent',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        pageUrl,
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
-    );
+    const args = [
+      '-f', 'best[ext=mp4]/best[vcodec!=none][acodec!=none]/best',
+      '-o', '-',
+      '--no-playlist',
+      '--no-warnings',
+      '--quiet',
+      '--no-progress',
+      '--restrict-filenames',
+      '--impersonate', 'chrome',
+      '--user-agent',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      '--add-header', 'Referer:https://kick.com/',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    ];
+
+    const cookie = process.env.KICK_COOKIE?.trim();
+    if (cookie) {
+      args.push('--add-header', `Cookie:${cookie}`);
+    }
+
+    args.push(pageUrl);
+
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     const timer = setTimeout(() => {
       if (!finished) {
