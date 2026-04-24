@@ -64,9 +64,55 @@ async function compressWithFfmpeg(inFile, outFile, targetBytes) {
   });
 }
 
+function runYtDlp(pageUrl, outFile, { timeoutMs, impersonate, cookie }) {
+  const args = [
+    '-f', 'best[ext=mp4]/best[vcodec!=none][acodec!=none]/best',
+    '-o', outFile,
+    '--no-playlist',
+    '--no-warnings',
+    '--quiet',
+    '--no-progress',
+    '--retries', '10',
+    '--extractor-retries', '5',
+    '--socket-timeout', '15',
+  ];
+  if (impersonate) args.push('--impersonate', impersonate);
+  args.push(
+    '--user-agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    '--add-header', 'Referer:https://kick.com/',
+    '--add-header', 'Origin:https://kick.com',
+    '--add-header', 'Accept-Language:en-US,en;q=0.9',
+  );
+  if (cookie) args.push('--add-header', `Cookie:${cookie}`);
+  args.push(pageUrl);
+
+  return new Promise((resolve) => {
+    const p = spawn('yt-dlp', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const errLines = [];
+    p.stderr.on('data', (d) => {
+      const line = d.toString().trim();
+      if (line) errLines.push(line);
+    });
+    const timer = setTimeout(() => {
+      try { p.kill('SIGKILL'); } catch {}
+      resolve({ ok: false, reason: 'timeout', stderr: errLines });
+    }, timeoutMs);
+    p.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0, code, stderr: errLines });
+    });
+    p.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, reason: 'spawn', error: err.message, stderr: errLines });
+    });
+  });
+}
+
 /**
  * Download a Kick clip via yt-dlp to a temp file, auto-compressing with ffmpeg
- * if the source exceeds `maxBytes`. Returns an in-memory Buffer or null on failure.
+ * if the source exceeds `maxBytes`. Retries across impersonation targets since
+ * Cloudflare can 403 intermittently on data-center IPs. Returns a Buffer or null.
  */
 export async function downloadClipWithYtDlp(pageUrl, {
   maxBytes = DEFAULT_MAX_BYTES,
@@ -76,51 +122,24 @@ export async function downloadClipWithYtDlp(pageUrl, {
   const id = crypto.randomBytes(8).toString('hex');
   const inFile = path.join(tmpDir, `clip-${id}.mp4`);
   const outFile = path.join(tmpDir, `clip-${id}-c.mp4`);
-
-  const args = [
-    '-f', 'best[ext=mp4]/best[vcodec!=none][acodec!=none]/best',
-    '-o', inFile,
-    '--no-playlist',
-    '--no-warnings',
-    '--quiet',
-    '--no-progress',
-    '--impersonate', 'chrome',
-    '--user-agent',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    '--add-header', 'Referer:https://kick.com/',
-    '--add-header', 'Accept-Language:en-US,en;q=0.9',
-  ];
-
   const cookie = process.env.KICK_COOKIE?.trim();
-  if (cookie) args.push('--add-header', `Cookie:${cookie}`);
 
-  args.push(pageUrl);
+  // Try a few impersonation targets; Cloudflare sometimes lets one through
+  // while blocking another from the same IP.
+  const targets = ['chrome', 'chrome-120', 'safari', 'edge'];
+  let ok = false;
 
-  const ok = await new Promise((resolve) => {
-    const p = spawn('yt-dlp', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    const errLines = [];
-    p.stderr.on('data', (d) => {
-      const line = d.toString().trim();
-      if (line) errLines.push(line);
-    });
-    const timer = setTimeout(() => {
-      try { p.kill('SIGKILL'); } catch {}
-      console.log('[yt-dlp] timeout');
-      resolve(false);
-    }, timeoutMs);
-    p.on('close', (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        console.log(`[yt-dlp] exit ${code}`, errLines.slice(-3).join(' | '));
-      }
-      resolve(code === 0);
-    });
-    p.on('error', (err) => {
-      clearTimeout(timer);
-      console.log('[yt-dlp] spawn error:', err.message);
-      resolve(false);
-    });
-  });
+  for (const target of targets) {
+    console.log(`[yt-dlp] attempt impersonate=${target}`);
+    const res = await runYtDlp(pageUrl, inFile, { timeoutMs, impersonate: target, cookie });
+    if (res.ok) {
+      ok = true;
+      break;
+    }
+    const tail = (res.stderr || []).slice(-2).join(' | ');
+    console.log(`[yt-dlp] failed (${res.reason || 'exit'} code=${res.code ?? ''}): ${tail}`);
+    await fs.unlink(inFile).catch(() => {});
+  }
 
   if (!ok) {
     await fs.unlink(inFile).catch(() => {});
