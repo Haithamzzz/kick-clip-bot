@@ -13,8 +13,31 @@ import { fetchOpenGraphImage, parseClipInput } from './parse-clip.js';
 const EMBED_COLOR = 0x232428;
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
+
+function isLikelyImageAttachment(att) {
+  if (!att?.url) return false;
+  if (att.contentType?.startsWith('image/')) return true;
+  return /\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(att.url);
+}
+
+async function findLatestImageFromUser(interaction, limit = 30) {
+  const channel = interaction.channel;
+  if (!channel?.isTextBased?.() || !channel.messages?.fetch) return null;
+
+  try {
+    const messages = await channel.messages.fetch({ limit });
+    for (const msg of messages.values()) {
+      if (msg.author?.id !== interaction.user.id) continue;
+      const img = msg.attachments.find((att) => isLikelyImageAttachment(att));
+      if (img?.url) return img.url;
+    }
+  } catch {
+    // Ignore fetch errors and continue with other thumbnail methods
+  }
+  return null;
+}
 
 function buildClipMessage({ title, pageUrl, displayHandle, imageUrl }) {
   // If we have our own image, suppress Discord auto-unfurl (<...>) and use custom embed.
@@ -75,6 +98,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply();
 
     let imageUrl = thumbnailAttachment?.url || overrideImage || null;
+    if (!imageUrl) {
+      imageUrl = await findLatestImageFromUser(interaction);
+    }
     if (!imageUrl) {
       imageUrl = await fetchOpenGraphImage(parsed.canonicalUrl);
       if (!imageUrl && pageUrl !== parsed.canonicalUrl) {
