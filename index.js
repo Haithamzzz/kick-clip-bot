@@ -1,6 +1,7 @@
 import { envPath } from './load-env.js';
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -26,6 +27,45 @@ function isLikelyImageAttachment(att) {
   return /\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(att.url);
 }
 
+/**
+ * Download a remote mp4 to memory, bounded by `maxBytes` so we never hit Discord's
+ * per-message upload ceiling. Returns Buffer or null on failure / oversize.
+ */
+async function downloadMp4ToBuffer(videoUrl, maxBytes = 24 * 1024 * 1024) {
+  try {
+    const res = await fetch(videoUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+        Referer: 'https://kick.com/',
+      },
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok || !res.body) return null;
+
+    const contentLength = Number(res.headers.get('content-length'));
+    if (contentLength && contentLength > maxBytes) return null;
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        try { reader.cancel(); } catch {}
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+  } catch {
+    return null;
+  }
+}
+
 async function findLatestImageFromUser(interaction, limit = 30) {
   const channel = interaction.channel;
   if (!channel?.isTextBased?.() || !channel.messages?.fetch) return null;
@@ -48,16 +88,14 @@ function buildClipMessage({
   pageUrl,
   displayHandle,
   imageUrl,
-  videoUrl,
+  videoBuffer,
 }) {
   const headerLines = [`New Kick Clip | ${title}`];
-  // Put the mp4 on its own line so Discord unfurls it as an inline video player.
-  if (videoUrl) headerLines.push(videoUrl);
-  // Always include the clip page URL; hide auto-unfurl if we already have media/image.
-  headerLines.push(videoUrl || imageUrl ? `<${pageUrl}>` : pageUrl);
+  // When we attach the mp4 file, hide the auto-link so Discord shows only the attachment preview.
+  headerLines.push(videoBuffer || imageUrl ? `<${pageUrl}>` : pageUrl);
 
   const embeds = [];
-  if (!videoUrl && imageUrl) {
+  if (!videoBuffer && imageUrl) {
     embeds.push(
       new EmbedBuilder()
         .setColor(EMBED_COLOR)
@@ -77,10 +115,15 @@ function buildClipMessage({
       .setEmoji('📥')
   );
 
+  const files = videoBuffer
+    ? [new AttachmentBuilder(videoBuffer, { name: 'clip.mp4' })]
+    : [];
+
   return {
     content: headerLines.join('\n'),
     embeds,
     components: [row],
+    files,
   };
 }
 
@@ -111,34 +154,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const parsed = parseClipInput(pageUrl);
     await interaction.deferReply();
 
-    let videoUrl = null;
+    let videoBuffer = null;
     let imageUrl = thumbnailAttachment?.url || overrideImage || null;
 
     if (parsed.kind === 'kick' && parsed.clipId) {
       const kick = await fetchKickClipData(parsed.clipId);
-      if (kick?.videoUrl) videoUrl = kick.videoUrl;
+      if (kick?.videoUrl) {
+        videoBuffer = await downloadMp4ToBuffer(kick.videoUrl);
+      }
       if (!imageUrl && kick?.thumbnailUrl) imageUrl = kick.thumbnailUrl;
     }
 
-    if (!imageUrl && !videoUrl) {
+    if (!imageUrl && !videoBuffer) {
       imageUrl = await findLatestImageFromUser(interaction);
     }
-    if (!imageUrl && !videoUrl) {
+    if (!imageUrl && !videoBuffer) {
       imageUrl = await fetchOpenGraphImage(parsed.canonicalUrl);
       if (!imageUrl && pageUrl !== parsed.canonicalUrl) {
         imageUrl = await fetchOpenGraphImage(pageUrl);
       }
     }
 
-    const { content, embeds, components } = buildClipMessage({
+    const { content, embeds, components, files } = buildClipMessage({
       title,
       pageUrl: parsed.canonicalUrl,
       displayHandle: parsed.displayHandle,
       imageUrl: imageUrl || null,
-      videoUrl: videoUrl || null,
+      videoBuffer,
     });
 
-    await interaction.editReply({ content, embeds, components });
+    await interaction.editReply({ content, embeds, components, files });
     return;
   }
 });
