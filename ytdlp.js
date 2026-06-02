@@ -4,7 +4,8 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 
-const DEFAULT_MAX_BYTES = 24 * 1024 * 1024; // stay under Discord's 25 MB cap
+const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // Discord's default attachment cap
+const MAX_VIDEO_HEIGHT = 1080;
 
 function probeDuration(file) {
   return new Promise((resolve) => {
@@ -35,6 +36,8 @@ async function compressWithFfmpeg(inFile, outFile, targetBytes) {
     const p = spawn('ffmpeg', [
       '-y',
       '-i', inFile,
+      '-map', '0:v:0',
+      '-map', '0:a?',
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-b:v', `${videoKbps}k`,
@@ -66,8 +69,9 @@ async function compressWithFfmpeg(inFile, outFile, targetBytes) {
 
 function runYtDlp(pageUrl, outFile, { timeoutMs, impersonate, cookie }) {
   const args = [
-    '-f', 'best[ext=mp4]/best[vcodec!=none][acodec!=none]/best',
+    '-f', `bv*[height<=${MAX_VIDEO_HEIGHT}][ext=mp4]+ba[ext=m4a]/b[height<=${MAX_VIDEO_HEIGHT}][ext=mp4]/bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`,
     '-o', outFile,
+    '--merge-output-format', 'mp4',
     '--no-playlist',
     '--no-warnings',
     '--quiet',
@@ -110,9 +114,13 @@ function runYtDlp(pageUrl, outFile, { timeoutMs, impersonate, cookie }) {
 }
 
 /**
- * Download a Kick clip via yt-dlp to a temp file, auto-compressing with ffmpeg
- * if the source exceeds `maxBytes`. Retries across impersonation targets since
- * Cloudflare can 403 intermittently on data-center IPs. Returns a Buffer or null.
+ * Download a full-length Kick clip via yt-dlp to a temp file, preferring the
+ * best available MP4 at or below 1080p. If the source exceeds `maxBytes`,
+ * re-encode bitrate with ffmpeg without trimming. Retries across impersonation
+ * targets since Cloudflare can 403 intermittently on data-center IPs.
+ *
+ * Returns { filePath, bytes, dispose } or null. Call dispose() after Discord has
+ * finished uploading the attachment.
  */
 export async function downloadClipWithYtDlp(pageUrl, {
   maxBytes = DEFAULT_MAX_BYTES,
@@ -165,13 +173,24 @@ export async function downloadClipWithYtDlp(pageUrl, {
     }
   }
 
-  const buf = await fs.readFile(finalFile).catch(() => null);
-  await fs.unlink(inFile).catch(() => {});
-  if (finalFile !== inFile) await fs.unlink(outFile).catch(() => {});
+  const finalStat = await fs.stat(finalFile).catch(() => null);
 
-  if (!buf || buf.length > maxBytes) {
+  if (!finalStat || finalStat.size > maxBytes) {
     console.log('[yt-dlp] final buffer too large or missing');
+    await fs.unlink(inFile).catch(() => {});
+    await fs.unlink(outFile).catch(() => {});
     return null;
   }
-  return buf;
+
+  if (finalFile !== inFile) {
+    await fs.unlink(inFile).catch(() => {});
+  }
+
+  return {
+    filePath: finalFile,
+    bytes: finalStat.size,
+    dispose: async () => {
+      await fs.unlink(finalFile).catch(() => {});
+    },
+  };
 }

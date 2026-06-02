@@ -1,4 +1,8 @@
 import { envPath } from './load-env.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -17,6 +21,8 @@ import {
 import { downloadClipWithYtDlp } from './ytdlp.js';
 
 const EMBED_COLOR = 0x232428;
+const DEFAULT_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024;
+const UPLOAD_LIMIT_HEADROOM_RATIO = 0.98;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
@@ -29,10 +35,16 @@ function isLikelyImageAttachment(att) {
 }
 
 /**
- * Download a remote mp4 to memory, bounded by `maxBytes` so we never hit Discord's
- * per-message upload ceiling. Returns Buffer or null on failure / oversize.
+ * Download a remote mp4 to disk, bounded by `maxBytes` so we never hit Discord's
+ * per-attachment upload ceiling. Returns { filePath, bytes, dispose } or null.
  */
-async function downloadMp4ToBuffer(videoUrl, maxBytes = 24 * 1024 * 1024) {
+async function downloadMp4ToFile(videoUrl, maxBytes) {
+  const filePath = path.join(
+    os.tmpdir(),
+    `clip-${crypto.randomBytes(8).toString('hex')}.mp4`
+  );
+  let handle = null;
+
   try {
     const res = await fetch(videoUrl, {
       headers: {
@@ -48,23 +60,47 @@ async function downloadMp4ToBuffer(videoUrl, maxBytes = 24 * 1024 * 1024) {
     const contentLength = Number(res.headers.get('content-length'));
     if (contentLength && contentLength > maxBytes) return null;
 
+    handle = await fs.open(filePath, 'wx');
     const reader = res.body.getReader();
-    const chunks = [];
     let received = 0;
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       received += value.byteLength;
       if (received > maxBytes) {
         try { reader.cancel(); } catch {}
+        await handle.close().catch(() => {});
+        handle = null;
+        await fs.unlink(filePath).catch(() => {});
         return null;
       }
-      chunks.push(Buffer.from(value));
+      await handle.write(Buffer.from(value));
     }
-    return Buffer.concat(chunks);
+
+    await handle.close();
+    handle = null;
+
+    return {
+      filePath,
+      bytes: received,
+      dispose: async () => {
+        await fs.unlink(filePath).catch(() => {});
+      },
+    };
   } catch {
+    if (handle) await handle.close().catch(() => {});
+    await fs.unlink(filePath).catch(() => {});
     return null;
   }
+}
+
+function getUsableUploadLimit(interaction) {
+  const rawLimit = Number(interaction.attachmentSizeLimit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? rawLimit
+    : DEFAULT_UPLOAD_LIMIT_BYTES;
+  return Math.floor(limit * UPLOAD_LIMIT_HEADROOM_RATIO);
 }
 
 async function findLatestImageFromUser(interaction, limit = 30) {
@@ -89,14 +125,14 @@ function buildClipMessage({
   pageUrl,
   displayHandle,
   imageUrl,
-  videoBuffer,
+  videoFile,
 }) {
   const headerLines = [`New Kick Clip | ${title}`];
   // When we attach the mp4 file, hide the auto-link so Discord shows only the attachment preview.
-  headerLines.push(videoBuffer || imageUrl ? `<${pageUrl}>` : pageUrl);
+  headerLines.push(videoFile || imageUrl ? `<${pageUrl}>` : pageUrl);
 
   const embeds = [];
-  if (!videoBuffer && imageUrl) {
+  if (!videoFile && imageUrl) {
     embeds.push(
       new EmbedBuilder()
         .setColor(EMBED_COLOR)
@@ -116,8 +152,8 @@ function buildClipMessage({
       .setEmoji('📥')
   );
 
-  const files = videoBuffer
-    ? [new AttachmentBuilder(videoBuffer, { name: 'clip.mp4' })]
+  const files = videoFile
+    ? [new AttachmentBuilder(videoFile.filePath, { name: 'clip.mp4' })]
     : [];
 
   return {
@@ -155,34 +191,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const parsed = parseClipInput(pageUrl);
     await interaction.deferReply();
 
-    let videoBuffer = null;
+    const maxUploadBytes = getUsableUploadLimit(interaction);
+    console.log('[addclip] upload limit:', {
+      grantedBytes: interaction.attachmentSizeLimit ?? null,
+      usableBytes: maxUploadBytes,
+    });
+
+    let videoFile = null;
     let imageUrl = thumbnailAttachment?.url || overrideImage || null;
 
     if (parsed.kind === 'kick' && parsed.clipId) {
       // Primary: yt-dlp (bypasses Cloudflare using its built-in Kick extractor).
       console.log(`[addclip] yt-dlp downloading ${parsed.canonicalUrl}`);
-      videoBuffer = await downloadClipWithYtDlp(parsed.canonicalUrl);
+      videoFile = await downloadClipWithYtDlp(parsed.canonicalUrl, {
+        maxBytes: maxUploadBytes,
+      });
       console.log('[addclip] yt-dlp result:', {
-        ok: Boolean(videoBuffer),
-        bytes: videoBuffer?.length ?? 0,
+        ok: Boolean(videoFile),
+        bytes: videoFile?.bytes ?? 0,
       });
 
-      if (!videoBuffer) {
+      if (!videoFile) {
         // Fallback: try direct Kick API (may need KICK_COOKIE).
         console.log('[addclip] falling back to Kick API');
         const kick = await fetchKickClipData(parsed.clipId);
         console.log('[addclip] kick api:', kick?.debug);
         if (kick?.videoUrl) {
-          videoBuffer = await downloadMp4ToBuffer(kick.videoUrl);
+          videoFile = await downloadMp4ToFile(kick.videoUrl, maxUploadBytes);
         }
         if (!imageUrl && kick?.thumbnailUrl) imageUrl = kick.thumbnailUrl;
       }
     }
 
-    if (!imageUrl && !videoBuffer) {
+    if (!imageUrl && !videoFile) {
       imageUrl = await findLatestImageFromUser(interaction);
     }
-    if (!imageUrl && !videoBuffer) {
+    if (!imageUrl && !videoFile) {
       imageUrl = await fetchOpenGraphImage(parsed.canonicalUrl);
       if (!imageUrl && pageUrl !== parsed.canonicalUrl) {
         imageUrl = await fetchOpenGraphImage(pageUrl);
@@ -194,10 +238,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       pageUrl: parsed.canonicalUrl,
       displayHandle: parsed.displayHandle,
       imageUrl: imageUrl || null,
-      videoBuffer,
+      videoFile,
     });
 
-    await interaction.editReply({ content, embeds, components, files });
+    try {
+      await interaction.editReply({ content, embeds, components, files });
+    } finally {
+      if (videoFile) await videoFile.dispose();
+    }
     return;
   }
 });
